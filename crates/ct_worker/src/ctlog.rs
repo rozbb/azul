@@ -187,6 +187,46 @@ impl PoolState {
     }
 }
 
+impl PoolState {
+    // Check if the key is already in the pool. If so, return the index of the
+    // entry in the pool, and a Receiver from which to read the entry metadata
+    // when it is sequenced.
+    fn check(&self, key: &LookupKey) -> Option<AddLeafResult> {
+        if let Some(index) = self.in_sequencing.get(key) {
+            // Entry is being sequenced.
+            Some(AddLeafResult::Pending {
+                pool_index: *index,
+                rx: self.in_sequencing_done.clone().unwrap(),
+                source: PendingSource::InSequencing,
+            })
+        } else {
+            self.current_pool
+                .by_hash
+                .get(key)
+                .map(|index| AddLeafResult::Pending {
+                    pool_index: *index,
+                    rx: self.current_pool.done.subscribe(),
+                    source: PendingSource::Pool,
+                })
+        }
+    }
+    // Add a new entry to the pool.
+    fn add(&mut self, key: LookupKey, leaf: &LogEntry) -> AddLeafResult {
+        if self.pending_leaves.len() >= MAX_POOL_SIZE {
+            return AddLeafResult::RateLimited;
+        }
+        self.current_pool.pending_leaves.push(leaf.clone());
+        let pool_index = (self.current_pool.pending_leaves.len() as u64) - 1;
+        self.current_pool.by_hash.insert(key, pool_index);
+
+        AddLeafResult::Pending {
+            pool_index,
+            rx: self.current_pool.done.subscribe(),
+            source: PendingSource::Sequencer,
+        }
+    }
+}
+
 // State owned by the sequencing loop.
 #[derive(Debug)]
 pub(crate) struct SequenceState {
