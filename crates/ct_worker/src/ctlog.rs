@@ -64,29 +64,6 @@ pub(crate) struct LogConfig {
     pub(crate) max_pending_entry_holds: usize,
 }
 
-/// A pool of pending log entries that are sequenced together. Clients subscribe
-/// to pools to learn when their submitted entries have been processed.
-#[derive(Debug)]
-struct Pool {
-    pending_leaves: Vec<LogEntry>,
-    by_hash: HashMap<LookupKey, (u64, Receiver<SequenceMetadata>)>,
-    // Sends the index of the first sequenced entry in the pool,
-    // and the pool's sequencing timestamp.
-    done: Sender<SequenceMetadata>,
-}
-
-impl Default for Pool {
-    /// Returns a pool initialized with a watch channel.
-    fn default() -> Self {
-        let (tx, _) = watch::channel((0, 0));
-        Self {
-            pending_leaves: vec![],
-            by_hash: HashMap::new(),
-            done: tx,
-        }
-    }
-}
-
 /// Ephemeral state for pooling entries to the CT log.
 ///
 /// The pool is written to by `add_leaf_to_pool`, and by the sequencer
@@ -223,8 +200,7 @@ impl PoolState {
                 source: PendingSource::InSequencing,
             })
         } else {
-            self.current_pool
-                .by_hash
+            self.pending
                 .get(key)
                 .map(|(index, rx)| AddLeafResult::Pending {
                     pool_index: *index,
@@ -235,21 +211,33 @@ impl PoolState {
     }
     // Add a new entry to the pool.
     fn add(&mut self, key: LookupKey, leaf: &LogEntry) -> AddLeafResult {
-        if self.pending_leaves.len() >= MAX_POOL_SIZE {
+        if self.pending_entries.len() >= MAX_POOL_SIZE {
             return AddLeafResult::RateLimited;
         }
-        self.current_pool.pending_leaves.push(leaf.clone());
-        let pool_index = (self.current_pool.pending_leaves.len() as u64) - 1;
-        let rx = self.current_pool.done.subscribe();
-        self.current_pool
-            .by_hash
-            .insert(key, (pool_index, rx.clone()));
+        self.pending_entries.push(leaf.clone());
+        let pool_index = (self.pending_entries.len() as u64) - 1;
+        let rx = self.pending_done.subscribe();
+        self.pending.insert(key, (pool_index, rx.clone()));
 
         AddLeafResult::Pending {
             pool_index,
             rx,
             source: PendingSource::Sequencer,
         }
+    }
+    // Take the entries from the pool that are ready to be sequenced and the
+    // corresponding Senders to update when the entries have been sequenced.
+    fn take(&mut self) -> (Vec<LogEntry>, Sender<SequenceMetadata>) {
+        self.in_sequencing = std::mem::take(&mut self.pending);
+        (
+            std::mem::take(&mut self.pending_entries),
+            std::mem::take(&mut self.pending_done),
+        )
+    }
+    // Reset the map of in-sequencing entries. This should be called after
+    // sequencing completes.
+    fn reset(&mut self) {
+        self.in_sequencing.clear();
     }
 }
 
