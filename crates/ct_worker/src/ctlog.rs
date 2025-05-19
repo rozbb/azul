@@ -210,11 +210,11 @@ impl PoolState {
         }
     }
     // Add a new entry to the pool.
-    fn add(&mut self, key: LookupKey, leaf: &LogEntry) -> AddLeafResult {
+    fn add(&mut self, key: LookupKey, entry: &PendingLogEntry) -> AddLeafResult {
         if self.pending_entries.len() >= MAX_POOL_SIZE {
             return AddLeafResult::RateLimited;
         }
-        self.pending_entries.push(leaf.clone());
+        self.pending_entries.push(entry.clone());
         let pool_index = (self.pending_entries.len() as u64) - 1;
         let rx = self.pending_done.subscribe();
         self.pending.insert(key, (pool_index, rx.clone()));
@@ -227,7 +227,7 @@ impl PoolState {
     }
     // Take the entries from the pool that are ready to be sequenced and the
     // corresponding Senders to update when the entries have been sequenced.
-    fn take(&mut self) -> (Vec<LogEntry>, Sender<SequenceMetadata>) {
+    fn take(&mut self) -> (Vec<PendingLogEntry>, Sender<SequenceMetadata>) {
         self.in_sequencing = std::mem::take(&mut self.pending);
         (
             std::mem::take(&mut self.pending_entries),
