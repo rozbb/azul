@@ -188,25 +188,20 @@ impl PoolState {
 }
 
 impl PoolState {
-    // Check if the key is already in the pool. If so, return the index of the
-    // entry in the pool, and a Receiver from which to read the entry metadata
-    // when it is sequenced.
+    // Check if the key is already in the pool. If so, return a Receiver from
+    // which to read the entry metadata when it is sequenced.
     fn check(&self, key: &LookupKey) -> Option<AddLeafResult> {
-        if let Some((index, rx)) = self.in_sequencing.get(key) {
+        if let Some(rx) = self.in_sequencing.get(key) {
             // Entry is being sequenced.
             Some(AddLeafResult::Pending {
-                pool_index: *index,
                 rx: rx.clone(),
                 source: PendingSource::InSequencing,
             })
         } else {
-            self.pending
-                .get(key)
-                .map(|(index, rx)| AddLeafResult::Pending {
-                    pool_index: *index,
-                    rx: rx.clone(),
-                    source: PendingSource::Pool,
-                })
+            self.pending.get(key).map(|rx| AddLeafResult::Pending {
+                rx: rx.clone(),
+                source: PendingSource::Pool,
+            })
         }
     }
     // Add a new entry to the pool.
@@ -214,25 +209,20 @@ impl PoolState {
         if self.pending_entries.len() >= MAX_POOL_SIZE {
             return AddLeafResult::RateLimited;
         }
-        self.pending_entries.push(entry.clone());
-        let pool_index = (self.pending_entries.len() as u64) - 1;
-        let rx = self.pending_done.subscribe();
-        self.pending.insert(key, (pool_index, rx.clone()));
+        let (tx, rx) = channel((0, 0));
+        self.pending_entries.push((entry.clone(), tx));
+        self.pending.insert(key, rx.clone());
 
         AddLeafResult::Pending {
-            pool_index,
             rx,
             source: PendingSource::Sequencer,
         }
     }
     // Take the entries from the pool that are ready to be sequenced and the
     // corresponding Senders to update when the entries have been sequenced.
-    fn take(&mut self) -> (Vec<PendingLogEntry>, Sender<SequenceMetadata>) {
+    fn take(&mut self) -> Vec<(PendingLogEntry, Sender<SequenceMetadata>)> {
         self.in_sequencing = std::mem::take(&mut self.pending);
-        (
-            std::mem::take(&mut self.pending_entries),
-            std::mem::take(&mut self.pending_done),
-        )
+        std::mem::take(&mut self.pending_entries)
     }
     // Reset the map of in-sequencing entries. This should be called after
     // sequencing completes.
