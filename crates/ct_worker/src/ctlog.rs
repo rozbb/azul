@@ -64,6 +64,29 @@ pub(crate) struct LogConfig {
     pub(crate) max_pending_entry_holds: usize,
 }
 
+/// A pool of pending log entries that are sequenced together. Clients subscribe
+/// to pools to learn when their submitted entries have been processed.
+#[derive(Debug)]
+struct Pool {
+    pending_leaves: Vec<LogEntry>,
+    by_hash: HashMap<LookupKey, (u64, Receiver<SequenceMetadata>)>,
+    // Sends the index of the first sequenced entry in the pool,
+    // and the pool's sequencing timestamp.
+    done: Sender<SequenceMetadata>,
+}
+
+impl Default for Pool {
+    /// Returns a pool initialized with a watch channel.
+    fn default() -> Self {
+        let (tx, _) = watch::channel((0, 0));
+        Self {
+            pending_leaves: vec![],
+            by_hash: HashMap::new(),
+            done: tx,
+        }
+    }
+}
+
 /// Ephemeral state for pooling entries to the CT log.
 ///
 /// The pool is written to by `add_leaf_to_pool`, and by the sequencer
@@ -192,20 +215,20 @@ impl PoolState {
     // entry in the pool, and a Receiver from which to read the entry metadata
     // when it is sequenced.
     fn check(&self, key: &LookupKey) -> Option<AddLeafResult> {
-        if let Some(index) = self.in_sequencing.get(key) {
+        if let Some((index, rx)) = self.in_sequencing.get(key) {
             // Entry is being sequenced.
             Some(AddLeafResult::Pending {
                 pool_index: *index,
-                rx: self.in_sequencing_done.clone().unwrap(),
+                rx: rx.clone(),
                 source: PendingSource::InSequencing,
             })
         } else {
             self.current_pool
                 .by_hash
                 .get(key)
-                .map(|index| AddLeafResult::Pending {
+                .map(|(index, rx)| AddLeafResult::Pending {
                     pool_index: *index,
-                    rx: self.current_pool.done.subscribe(),
+                    rx: rx.clone(),
                     source: PendingSource::Pool,
                 })
         }
@@ -217,11 +240,14 @@ impl PoolState {
         }
         self.current_pool.pending_leaves.push(leaf.clone());
         let pool_index = (self.current_pool.pending_leaves.len() as u64) - 1;
-        self.current_pool.by_hash.insert(key, pool_index);
+        let rx = self.current_pool.done.subscribe();
+        self.current_pool
+            .by_hash
+            .insert(key, (pool_index, rx.clone()));
 
         AddLeafResult::Pending {
             pool_index,
-            rx: self.current_pool.done.subscribe(),
+            rx,
             source: PendingSource::Sequencer,
         }
     }
