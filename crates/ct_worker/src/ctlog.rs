@@ -205,12 +205,12 @@ impl PoolState {
         }
     }
     // Add a new entry to the pool.
-    fn add(&mut self, key: LookupKey, entry: &PendingLogEntry) -> AddLeafResult {
+    fn add(&mut self, key: LookupKey, entry: PendingLogEntry) -> AddLeafResult {
         if self.pending_entries.len() >= MAX_POOL_SIZE {
             return AddLeafResult::RateLimited;
         }
         let (tx, rx) = channel((0, 0));
-        self.pending_entries.push((entry.clone(), tx));
+        self.pending_entries.push((entry, tx));
         self.pending.insert(key, rx.clone());
 
         AddLeafResult::Pending {
