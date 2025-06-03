@@ -105,7 +105,18 @@ pub(crate) struct PoolState<P: PendingLogEntryTrait> {
     in_sequencing_dedup: HashMap<LookupKey, Receiver<SequenceMetadata>>,
 }
 
-impl PoolState {
+impl<E: PendingLogEntryTrait> Default for PoolState<E> {
+    fn default() -> Self {
+        Self {
+            oldest_pending_entry_holds: Default::default(),
+            pending_entries: Default::default(),
+            pending_dedup: Default::default(),
+            in_sequencing_dedup: Default::default(),
+        }
+    }
+}
+
+impl<E: PendingLogEntryTrait> PoolState<E> {
     // Check if the key is already in the pool. If so, return a Receiver from
     // which to read the entry metadata when it is sequenced.
     fn check(&self, key: &LookupKey) -> Option<AddLeafResult> {
@@ -125,7 +136,7 @@ impl PoolState {
         }
     }
     // Add a new entry to the pool.
-    fn add(&mut self, key: LookupKey, entry: PendingLogEntry) -> AddLeafResult {
+    fn add(&mut self, key: LookupKey, entry: E) -> AddLeafResult {
         if self.pending_entries.len() >= MAX_POOL_SIZE {
             return AddLeafResult::RateLimited;
         }
@@ -147,7 +158,7 @@ impl PoolState {
         &mut self,
         old_size: u64,
         max_pending_entry_holds: usize,
-    ) -> Vec<(PendingLogEntry, Sender<SequenceMetadata>)> {
+    ) -> Vec<(E, Sender<SequenceMetadata>)> {
         let new_size = old_size + self.pending_entries.len() as u64;
         let leftover = new_size % u64::from(TlogTile::FULL_WIDTH);
 
@@ -199,109 +210,6 @@ impl PoolState {
     // sequencing completes.
     fn reset(&mut self) {
         self.in_sequencing_dedup.clear();
-    }
-}
-
-impl<P: PendingLogEntryTrait> Default for PoolState<P> {
-    fn default() -> Self {
-        PoolState {
-            holds: 0,
-            pending_entries: Default::default(),
-            pending: Default::default(),
-            in_sequencing: Default::default(),
-        }
-    }
-}
-
-impl<E: PendingLogEntryTrait> PoolState<E> {
-    // Check if the key is already in the pool. If so, return a Receiver from
-    // which to read the entry metadata when it is sequenced.
-    fn check(&self, key: &LookupKey) -> Option<AddLeafResult> {
-        if let Some(rx) = self.in_sequencing.get(key) {
-            // Entry is being sequenced.
-            Some(AddLeafResult::Pending {
-                rx: rx.clone(),
-                source: PendingSource::InSequencing,
-            })
-        } else {
-            self.pending.get(key).map(|rx| AddLeafResult::Pending {
-                rx: rx.clone(),
-                source: PendingSource::Pool,
-            })
-        }
-    }
-    // Add a new entry to the pool.
-    fn add(&mut self, key: LookupKey, entry: E) -> AddLeafResult {
-        if self.pending_entries.len() >= MAX_POOL_SIZE {
-            return AddLeafResult::RateLimited;
-        }
-        let (tx, rx) = channel((0, 0));
-        self.pending_entries.push((entry, tx));
-        self.pending.insert(key, rx.clone());
-
-        AddLeafResult::Pending {
-            rx,
-            source: PendingSource::Sequencer,
-        }
-    }
-    // Take the entries from the pool that are ready to be sequenced and the
-    // corresponding Senders to update when the entries have been sequenced.
-    //
-    // Hold back any leftover entries that would be published as a partial tile
-    // unless they have already been held back `max_pending_entry_holds` times.
-    fn take(
-        &mut self,
-        old_size: u64,
-        max_pending_entry_holds: usize,
-    ) -> Vec<(E, Sender<SequenceMetadata>)> {
-        let new_size = old_size + self.pending_entries.len() as u64;
-        let leftover = new_size % u64::from(TlogTile::FULL_WIDTH);
-
-        let publishing_full_tile =
-            new_size / u64::from(TlogTile::FULL_WIDTH) > old_size / u64::from(TlogTile::FULL_WIDTH);
-        if publishing_full_tile {
-            // We're going to publish at least one full tile which will contain
-            // any leftover entries from the previous sequencing. Reset the
-            // count since the new leftover entries have not yet been held back.
-            self.holds = 0;
-        }
-        // Flush all of the leftover entries if the oldest is before the cutoff.
-        let flush_oldest = self.holds >= max_pending_entry_holds;
-
-        if leftover == 0 || flush_oldest {
-            // Sequence everything. Either there are no leftovers or they have
-            // already been held back the maximum number of times.
-            self.holds = 0;
-            self.in_sequencing = std::mem::take(&mut self.pending);
-            std::mem::take(&mut self.pending_entries)
-        } else {
-            // Hold back the leftovers to avoid creating a partial tile.
-            self.holds += 1;
-
-            if publishing_full_tile {
-                // Return the pending entries to be published in full tiles and
-                // retain the rest.
-                let split_index = self.pending_entries.len() - usize::try_from(leftover).unwrap();
-                let leftover_entries = self.pending_entries.split_off(split_index);
-                let leftover_pending = leftover_entries
-                    .iter()
-                    .filter_map(|(entry, _)| {
-                        let lookup_key = entry.lookup_key();
-                        self.pending.remove(&lookup_key).map(|rx| (lookup_key, rx))
-                    })
-                    .collect::<HashMap<_, _>>();
-                self.in_sequencing = std::mem::replace(&mut self.pending, leftover_pending);
-                std::mem::replace(&mut self.pending_entries, leftover_entries)
-            } else {
-                // We didn't fill up a full tile, so nothing to return.
-                Vec::new()
-            }
-        }
-    }
-    // Reset the map of in-sequencing entries. This should be called after
-    // sequencing completes.
-    fn reset(&mut self) {
-        self.in_sequencing.clear();
     }
 }
 
