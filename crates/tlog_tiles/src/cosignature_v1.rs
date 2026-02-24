@@ -7,25 +7,73 @@ use ed25519_dalek::{
 };
 use signed_note::{compute_key_id, KeyName, NoteError, NoteSignature, NoteVerifier, SignatureType};
 
-use crate::{CheckpointText, CheckpointSigner, UnixTimestamp};
+use crate::{CheckpointSigner, CheckpointText, UnixTimestamp};
 
-/// Implementation of [`CheckpointSigner`] that produces a timestamped Ed25519 cosignature/v1 (alg 0x04 from <c2sp.org/signed-note>).
-pub struct CosignatureV1CheckpointSigner {
-    v: CosignatureV1NoteVerifier,
-    k: Ed25519SigningKey,
-}
+/// The first line present in a signed note using the cosignature-v1 signature scheme
+const COSIGNATURE_V1_DOMAIN_SEPARATING_PREFIX: &[u8] = b"cosignature/v1";
+
+/// Implementation of [`CheckpointSigner`] that produces a timestamped Ed25519 cosignature/v1 (alg
+/// 0x04 from <https://c2sp.org/signed-note>).
+pub struct CosignatureV1CheckpointSigner(CustomPrefixTimestampedCheckpointSigner);
 
 impl CosignatureV1CheckpointSigner {
-    /// Returns a new `CosignatureV1CheckpointSigner`.
     pub fn new(name: KeyName, k: Ed25519SigningKey) -> Self {
-        Self {
-            v: CosignatureV1NoteVerifier::new(name, k.verifying_key()),
+        Self(CustomPrefixTimestampedCheckpointSigner::new(
+            name,
             k,
-        }
+            COSIGNATURE_V1_DOMAIN_SEPARATING_PREFIX.to_vec(),
+        ))
     }
 }
 
 impl CheckpointSigner for CosignatureV1CheckpointSigner {
+    fn name(&self) -> &KeyName {
+        self.0.name()
+    }
+
+    fn key_id(&self) -> u32 {
+        self.0.key_id()
+    }
+
+    fn sign(
+        &self,
+        timestamp_unix_millis: UnixTimestamp,
+        checkpoint: &CheckpointText,
+    ) -> Result<NoteSignature, NoteError> {
+        self.0.sign(timestamp_unix_millis, checkpoint)
+    }
+
+    fn verifier(&self) -> Box<dyn NoteVerifier> {
+        self.0.verifier()
+    }
+}
+
+/// Implementation of [`CheckpointSigner`] that produces a timestamped Ed25519 signature (alg 0x04
+/// from <https://c2sp.org/signed-note>). Uses a custom domain separating prefix. When the domain
+/// separating prefix is `cosignature/v1`, this is equivalent to
+/// [`CosignatureV1CheckpointSigner`].
+pub struct CustomPrefixTimestampedCheckpointSigner {
+    v: CustomPrefixTimestampedNoteVerifier,
+    k: Ed25519SigningKey,
+    domain_separating_prefix: Vec<u8>,
+}
+
+impl CustomPrefixTimestampedCheckpointSigner {
+    /// Returns a new `CosignatureV1CheckpointSigner`.
+    pub fn new(name: KeyName, k: Ed25519SigningKey, domain_separating_prefix: Vec<u8>) -> Self {
+        Self {
+            v: CustomPrefixTimestampedNoteVerifier::new(
+                name,
+                k.verifying_key(),
+                domain_separating_prefix.clone(),
+            ),
+            k,
+            domain_separating_prefix,
+        }
+    }
+}
+
+impl CheckpointSigner for CustomPrefixTimestampedCheckpointSigner {
     fn name(&self) -> &KeyName {
         self.v.name()
     }
@@ -39,10 +87,14 @@ impl CheckpointSigner for CosignatureV1CheckpointSigner {
         timestamp_unix_millis: UnixTimestamp,
         checkpoint: &CheckpointText,
     ) -> Result<NoteSignature, NoteError> {
-        // Timestamp is in seconds.
+        // Timestamp is in seconds
         let timestamp_unix_secs = timestamp_unix_millis / 1000;
-        let mut msg = format!("cosignature/v1\ntime {timestamp_unix_secs}\n").into_bytes();
-        msg.extend(checkpoint.to_bytes());
+
+        let msg = construct_timestamped_message(
+            &self.domain_separating_prefix,
+            &checkpoint,
+            timestamp_unix_secs,
+        );
 
         // Ed25519 signing cannot fail
         let sig = self.k.try_sign(&msg).unwrap();
@@ -71,16 +123,55 @@ impl CheckpointSigner for CosignatureV1CheckpointSigner {
     }
 }
 
-/// [`CosignatureV1NoteVerifier`] is the verifier for the timestamped Ed25519 cosignature type defined in <https://c2sp.org/tlog-cosignature>.
+/// Verifier for the timestamped Ed25519 cosignature type defined in <https://c2sp.org/tlog-cosignature>.
 #[derive(Clone)]
-pub struct CosignatureV1NoteVerifier {
-    name: KeyName,
-    id: u32,
-    verifying_key: Ed25519VerifyingKey,
-}
+pub struct CosignatureV1NoteVerifier(CustomPrefixTimestampedNoteVerifier);
 
 impl CosignatureV1NoteVerifier {
     pub fn new(name: KeyName, verifying_key: Ed25519VerifyingKey) -> Self {
+        Self(CustomPrefixTimestampedNoteVerifier::new(
+            name,
+            verifying_key,
+            COSIGNATURE_V1_DOMAIN_SEPARATING_PREFIX.to_vec(),
+        ))
+    }
+}
+
+impl NoteVerifier for CosignatureV1NoteVerifier {
+    fn name(&self) -> &KeyName {
+        self.0.name()
+    }
+
+    fn key_id(&self) -> u32 {
+        self.0.key_id()
+    }
+
+    fn verify(&self, msg: &[u8], sig: &[u8]) -> bool {
+        self.0.verify(msg, sig)
+    }
+
+    fn extract_timestamp_millis(&self, sig: &[u8]) -> Result<Option<u64>, NoteError> {
+        self.0.extract_timestamp_millis(sig)
+    }
+}
+
+/// Verifier for the timestamped Ed25519 cosignature type defined in
+/// <https://c2sp.org/tlog-cosignature>.  Uses a custom domain separating prefix. When the domain
+/// separating prefix is `cosignature/v1`, this is equivalent to [`CosignatureV1NoteVerifier`].
+#[derive(Clone)]
+pub struct CustomPrefixTimestampedNoteVerifier {
+    name: KeyName,
+    id: u32,
+    verifying_key: Ed25519VerifyingKey,
+    domain_separating_prefix: Vec<u8>,
+}
+
+impl CustomPrefixTimestampedNoteVerifier {
+    pub fn new(
+        name: KeyName,
+        verifying_key: Ed25519VerifyingKey,
+        domain_separating_prefix: Vec<u8>,
+    ) -> Self {
         let id = {
             let pubkey = [
                 &[SignatureType::CosignatureV1 as u8],
@@ -89,15 +180,17 @@ impl CosignatureV1NoteVerifier {
             .concat();
             compute_key_id(&name, &pubkey)
         };
+
         Self {
             name,
             id,
             verifying_key,
+            domain_separating_prefix,
         }
     }
 }
 
-impl NoteVerifier for CosignatureV1NoteVerifier {
+impl NoteVerifier for CustomPrefixTimestampedNoteVerifier {
     fn name(&self) -> &KeyName {
         &self.name
     }
@@ -122,8 +215,11 @@ impl NoteVerifier for CosignatureV1NoteVerifier {
         };
 
         // Construct message to be signed from <https://github.com/C2SP/C2SP/blob/main/tlog-cosignature.md#signed-message>.
-        let mut msg = format!("cosignature/v1\ntime {sig_timestamp}\n").into_bytes();
-        msg.extend(checkpoint.to_bytes());
+        let msg = construct_timestamped_message(
+            &self.domain_separating_prefix,
+            &checkpoint,
+            sig_timestamp,
+        );
         self.verifying_key
             .verify(&msg, &ed25519_dalek::Signature::from_bytes(&sig_bytes))
             .is_ok()
@@ -136,6 +232,27 @@ impl NoteVerifier for CosignatureV1NoteVerifier {
             .map_err(|_| NoteError::Timestamp)?;
         Ok(Some(ts * 1000))
     }
+}
+
+/// Produces the text of a note to be signed by the timestamped signing algorithm. This is of the form:
+/// ```
+/// <domain_separating_prefix>
+/// time <sig_timestamp>
+/// <checkpoint>
+/// ```
+fn construct_timestamped_message(
+    domain_separating_prefix: &[u8],
+    checkpoint: &CheckpointText,
+    sig_timestamp: u64,
+) -> Vec<u8> {
+    [
+        domain_separating_prefix,
+        b"\ntime ",
+        sig_timestamp.to_string().as_bytes(),
+        b"\n",
+        checkpoint.to_bytes().as_ref(),
+    ]
+    .concat()
 }
 
 #[cfg(test)]
